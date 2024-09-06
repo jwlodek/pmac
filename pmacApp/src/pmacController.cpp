@@ -2770,6 +2770,8 @@ asynStatus pmacController::initializeProfile(size_t maxPoints) {
   }
   profileVelMode_ = (int *) malloc(sizeof(int) * maxPoints);
 
+  // Allocate memory for last the two positions of each axis
+  // previous and current position are used in velocity calculation for last element: Prev->Next and Current->Next
   if (tScanPrevBufferPositions) {
     free(tScanPrevBufferPositions);
   }
@@ -2785,6 +2787,43 @@ asynStatus pmacController::initializeProfile(size_t maxPoints) {
 
   // Finally call super class
   return asynMotorController::initializeProfile(maxPoints);
+}
+
+asynStatus pmacController::handleBufferRollover(int *numPointsToBuild) {
+  asynStatus status = asynSuccess;
+  static const char *functionName = "handleBufferRollover";
+
+  if (tScanPendingPointReady_ > 0) {
+    memmove(&profileTimes_[1], &profileTimes_[0], (*numPointsToBuild) * sizeof(double));
+    // Insert last Time from previous buffer into the first position
+    profileTimes_[0] = tScanPrevBufferTime;
+  }
+
+  // Append the points to the store
+  if(tScanPendingPoint_ > 0) {
+    if(tScanPendingPoint_ == tScanAxisMask_) {
+      (*numPointsToBuild)--;
+    } else {
+      debug(DEBUG_ERROR,functionName,"Inconsistent tScanPendingPoint_");
+      debugf(DEBUG_ERROR, functionName, "tScanPendingPoint_==> %d", tScanPendingPoint_);
+      debugf(DEBUG_ERROR, functionName, "tScanAxisMask_==> %d", tScanAxisMask_);
+    }
+  }
+  if(tScanPendingPointReady_ > 0) {
+    if(tScanPendingPointReady_ == tScanAxisMask_) {
+      (*numPointsToBuild)++;
+      tScanPendingPointReady_ = 0;
+    } else {
+      debug(DEBUG_ERROR,functionName, "Inconsistent tScanPendingPointReady_");
+      debugf(DEBUG_ERROR, functionName, "tScanPendingPointReady_==> %d", tScanPendingPointReady_);
+      debugf(DEBUG_ERROR, functionName, "tScanAxisMask_==> %d", tScanAxisMask_);
+    }
+  }
+
+  //Update last time from previous buffer
+  tScanPrevBufferTime = profileTimes_[(*numPointsToBuild)-1];
+
+  return status;
 }
 
 asynStatus pmacController::buildProfile() {
@@ -3004,24 +3043,7 @@ asynStatus pmacController::buildProfile(int csNo) {
     }
   }
 
-  if (tScanPendingPointReady_ > 0) {
-    memmove(&profileTimes_[1], &profileTimes_[0], (numPointsToBuild) * sizeof(double));
-    // Insert last Time from previous buffer into the first position
-    profileTimes_[0] = tScanPrevBufferTime;
-  }
-
-  if(tScanPendingPoint_ > 0) {
-    // Check if there is a pending velocity calculation, if so append 1 point less
-    if(tScanPendingPoint_ == tScanAxisMask_) {
-      numPointsToBuild--;
-    } else {
-      debug(DEBUG_ERROR, functionName, "Inconsistent tScanPendingPoint_");
-      debugf(DEBUG_ERROR, functionName, "tScanPendingPoint_==> %d", tScanPendingPoint_);
-      debugf(DEBUG_ERROR, functionName, "tScanAxisMask_==> %d", tScanAxisMask_);
-    }
-  }
-  //Update last time of the previous buffer
-  tScanPrevBufferTime = profileTimes_[numPointsToBuild-1];
+  status = this->handleBufferRollover(&numPointsToBuild);
 
   if (status == asynSuccess) {
     // Initialise the trajectory store
@@ -3104,31 +3126,7 @@ asynStatus pmacController::appendToProfile() {
       }
     }
 
-    if (tScanPendingPointReady_ > 0) {
-      memmove(&profileTimes_[1], &profileTimes_[0], (numPointsToBuild) * sizeof(double));
-      // Insert last Time from previous buffer into the first position
-      profileTimes_[0] = tScanPrevBufferTime;
-    }
-
-    // Append the points to the store
-    if(tScanPendingPoint_ > 0) {
-      if(tScanPendingPoint_ == tScanAxisMask_) {
-        numPointsToBuild--;
-      } else {
-        debug(DEBUG_ERROR,functionName,"Inconsistent tScanPendingPoint_");
-      }
-    }
-    if(tScanPendingPointReady_ > 0) {
-      if(tScanPendingPointReady_ == tScanAxisMask_) {
-        numPointsToBuild++;
-        tScanPendingPointReady_ = 0;
-      } else {
-        debug(DEBUG_ERROR,functionName, "Inconsistent tScanPendingPointReady_");
-      }
-    }
-
-    //Update last time from previous buffer
-    tScanPrevBufferTime = profileTimes_[numPointsToBuild-1];
+    status = this->handleBufferRollover(&numPointsToBuild);
 
     status = pTrajectory_->append(tScanPositions_, tScanVelocities_, profileTimes_, profileUser_,
                                   numPointsToBuild);
@@ -4611,6 +4609,36 @@ asynStatus pmacController::tScanBuildProfileArray(double *positions, double *vel
   return status;
 }
 
+asynStatus pmacController::tScanGetPreviousPoint(double *previousPos, double *previousVel, const double *positions, const double *velocities, int numPoints, int index, int csNum, int axis) {
+  asynStatus status = asynSuccess;
+  static const char *functionName = "tScanGetPreviousPoint";
+  char command[PMAC_MAXBUF_];
+  char reply[PMAC_MAXBUF_];
+
+  if(index > 0) {
+    // Get previous position and velocity from the current buffer
+    *previousPos = positions[index-1];
+    *previousVel = velocities[index-1];
+  } else if(pTrajectory_->getNoOfValidPoints()>1) {
+    // Get previous position and velocity from last buffer sent
+    *previousPos = tScanPrevBufferPositions[axis][1];
+    *previousVel = tScanPrevBufferVelocity[axis];
+  } else {
+    // Get previous position from last demand Q7x
+    // Set previous velocity to zero
+    sprintf(command, "&%dQ%d", csNum, (71+axis));
+    if (pBroker_->immediateWriteRead(command, reply) == asynSuccess) {
+      sscanf(reply,"%lf",previousPos);
+      *previousVel = 0.0;
+    } else {
+      debug(DEBUG_ERROR, functionName, "Failed to send command", command);
+      status = asynError;
+    }
+  }
+
+  return status;
+}
+
 asynStatus pmacController::tScanCalculateVelocityArray(double *positions, double *velocities, double *times, int numPoints, int index, int csNum, int axis) {
   asynStatus status = asynSuccess;
   static const char *functionName = "tScanCalculateVelocityArray";
@@ -4625,9 +4653,6 @@ asynStatus pmacController::tScanCalculateVelocityArray(double *positions, double
   double prevBuffPosition = 0;
   double prevBuffVelocity = 0;
   int prevBuffTime = 0;
-
-  char command[PMAC_MAXBUF_];
-  char reply[PMAC_MAXBUF_];
 
   // Check if there is a velocity calculation pending from previous buffer
   if((1 << axis & tScanPendingPoint_) > 0) {
@@ -4681,107 +4706,55 @@ asynStatus pmacController::tScanCalculateVelocityArray(double *positions, double
         debugf(DEBUG_ERROR, functionName, "Invalid times (%d and %d) at points %d and %d",
                times[index],times[index+1], index, (index+1));
         status = asynError;
+      }
+
+      if(index == numPoints-1){
+        // Next position and time not available, raise the flag for calculating the velocity at next iteration
+        tScanPendingPoint_ |= (1 << axis) ;
         break;
       }
-      if(index > 0) {
-        if(index < numPoints-1){
-          // Get previous position from the current buffer
-          previousPos = positions[index-1];
-        } else {
-          // Next position and time not available, raise the flag for calculating the velocity at next iteration
-          tScanPendingPoint_ |= (1 << axis) ;
-          break;
-        }
-      } else if(pTrajectory_->getNoOfValidPoints()>1) {
-        // Get previous position from last buffer sent
-        previousPos = tScanPrevBufferPositions[axis][1];
 
-      } else {
-        // Get previous position from last demand Q7x
-        // Set previous velocity as zero
-        sprintf(command, "&%dQ%d", csNum, (71+axis));
-        if (pBroker_->immediateWriteRead(command, reply) == asynSuccess) {
-          sscanf(reply,"%lf",&previousPos);
-          previousVel = 0.0;
-        } else {
-          debug(DEBUG_ERROR, functionName, "Failed to send command", command);
-          status = asynError;
-          break;
-        }
+      status = this->tScanGetPreviousPoint(&previousPos, &previousVel, positions, velocities, numPoints, index, csNum, axis);
+
+      if(status == asynSuccess) {
+        inverse_deltaTime = 1000000 / (times[index]+times[index+1]);
+        deltaPos = positions[index+1] - previousPos;
+        velocities[index] = inverse_deltaTime * deltaPos;
       }
-
-      inverse_deltaTime = 1000000 / (times[index]+times[index+1]);
-      deltaPos = positions[index+1] - previousPos;
-      velocities[index] = inverse_deltaTime * deltaPos;
       break;
 
     // Real Previous -> Current
     case 1:
-      if(index > 0) {
-        // Get previous position and velocity from the current buffer
-        previousPos = positions[index-1];
-        previousVel = velocities[index-1];
-      } else if(pTrajectory_->getNoOfValidPoints()>1) {
-        // Get previous position and velocity from last buffer sent
-        previousPos = tScanPrevBufferPositions[axis][1];
-        previousVel = tScanPrevBufferVelocity[axis];
-      } else {
-        // Get previous position from last demand Q7x
-        // Set previous velocity to zero
-        sprintf(command, "&%dQ%d", csNum, (71+axis));
-        if (pBroker_->immediateWriteRead(command, reply) == asynSuccess) {
-          sscanf(reply,"%lf",&previousPos);
-          previousVel = 0.0;
-        } else {
-          debug(DEBUG_ERROR, functionName, "Failed to send command", command);
-          status = asynError;
-        }
-      }
       if(times[index] <=  0) {
         debugf(DEBUG_ERROR, functionName, "Invalid time (%d) at point %d",
                times[index],index);
         status = asynError;
-        break;
       }
 
-      inverse_deltaTime = 1000000 / (times[index]);
-      deltaPos = positions[index] - previousPos;
-      velocities[index] = 2.0 * inverse_deltaTime * deltaPos - previousVel;
+      status = this->tScanGetPreviousPoint(&previousPos, &previousVel, positions, velocities, numPoints, index, csNum, axis);
+
+      if(status == asynSuccess) {
+        inverse_deltaTime = 1000000 / (times[index]);
+        deltaPos = positions[index] - previousPos;
+        velocities[index] = 2.0 * inverse_deltaTime * deltaPos - previousVel;
+      }
       break;
 
     // Average Previous -> Current
     case 2:
-      if(index > 0) {
-        // Get previous position and velocity from the current buffer
-        previousPos = positions[index-1];
-        previousVel = velocities[index-1];
-      } else if(pTrajectory_->getNoOfValidPoints()>1) {
-        // Get previous position and velocity from last buffer sent
-        previousPos = tScanPrevBufferPositions[axis][1];
-        previousVel = tScanPrevBufferVelocity[axis];
-      } else {
-        // Get previous position from last demand Q7x
-        // Set previous velocity to zero
-        sprintf(command, "&%dQ%d", csNum, (71+axis));
-        if (pBroker_->immediateWriteRead(command, reply) == asynSuccess) {
-          sscanf(reply,"%lf",&previousPos);
-          previousVel = 0.0;
-        } else {
-          debug(DEBUG_ERROR, functionName, "Failed to send command", command);
-          status = asynError;
-        }
-      }
-
       if(times[index] <=  0) {
         debugf(DEBUG_ERROR, functionName, "Invalid time (%d) at point %d",
                times[index], index);
         status = asynError;
-        break;
       }
 
-      inverse_deltaTime = 1000000 / (times[index]);
-      deltaPos = positions[index] - previousPos;
-      velocities[index] = inverse_deltaTime * deltaPos;
+      status = this->tScanGetPreviousPoint(&previousPos, &previousVel, positions, velocities, numPoints, index, csNum, axis);
+
+      if(status == asynSuccess) {
+        inverse_deltaTime = 1000000 / (times[index]);
+        deltaPos = positions[index] - previousPos;
+        velocities[index] = inverse_deltaTime * deltaPos;
+      }
       break;
 
     // Zero
@@ -4791,22 +4764,24 @@ asynStatus pmacController::tScanCalculateVelocityArray(double *positions, double
 
     // Average Current -> Next
     case 4:
-      // Last point in buffer
-      if(index == numPoints-1) {
-        tScanPendingPoint_ |= (1 << axis);
-        break;
-      }
       // Check Next time
       if(times[index+1] <= 0) {
         debugf(DEBUG_ERROR, functionName, "Invalid time (%d) at point %d",
                times[index+1], (index+1));
         status = asynError;
+      }
+
+      // Last point in buffer
+      if(index == numPoints-1) {
+        tScanPendingPoint_ |= (1 << axis);
         break;
       }
 
-      inverse_deltaTime = 1000000 / (times[index+1]);
-      deltaPos = positions[index+1] - positions[index];
-      velocities[index] = inverse_deltaTime * deltaPos;
+      if(status == asynSuccess) {
+        inverse_deltaTime = 1000000 / (times[index+1]);
+        deltaPos = positions[index+1] - positions[index];
+        velocities[index] = inverse_deltaTime * deltaPos;
+      }
       break;
 
     default:
@@ -4816,7 +4791,8 @@ asynStatus pmacController::tScanCalculateVelocityArray(double *positions, double
       break;
   }
 
-  if(index==numPoints-1) {
+  // TODO: Refactor the following as a function(?)
+  if(index == numPoints-1) {
     if((1 << axis & tScanPendingPointReady_) > 0) {
       // Shift elements in positions and velocities arrays
       memmove(&positions[1], &positions[0], (numPoints) * sizeof(double));

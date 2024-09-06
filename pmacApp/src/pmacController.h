@@ -300,6 +300,7 @@ public:
 
     // Trajectory scanning methods
     asynStatus initializeProfile(size_t maxPoints);
+    asynStatus handleBufferRollover(int *numPointsToBuild);
     asynStatus buildProfile();
     asynStatus buildProfile(int csNo);
     asynStatus appendToProfile();
@@ -354,6 +355,7 @@ public:
     asynStatus updateCsAssignmentParameters();
     asynStatus copyCsReadbackToDemand(bool manual);
     asynStatus tScanBuildProfileArray(double *positions, double *velocities, double *times, int axis, int numPoints);
+    asynStatus tScanGetPreviousPoint(double *previousPos, double *previousVel, const double *positions, const double *velocities, int numPoints, int index, int csNum, int axis);
     asynStatus tScanCalculateVelocityArray(double *positions, double *velocities, double *times, int numPoints, int index, int csNum, int axis);
     asynStatus tScanIncludedAxes(int *axisMask);
     void registerForLock(asynPortDriver *controller);
