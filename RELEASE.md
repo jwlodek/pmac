@@ -16,6 +16,15 @@ site location of dependencies.
 Release Notes
 =============
 
+
+R2-6-4 (Oct 30, 2024)
+==========================
+### Changes
+* Fix CS feedrate truncation                    - PR [#121](https://github.com/DiamondLightSource/pmac/pull/121)
+* Fix motor offset updating CS                  - PR [#123](https://github.com/DiamondLightSource/pmac/pull/123)
+* Replaced dls-controls with DiamondLightSource - PR [#128](https://github.com/DiamondLightSource/pmac/pull/128)
+
+
 R2-6-3 (Jan 31, 2024)
 ==========================
 ### Changes
